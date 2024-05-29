@@ -95,7 +95,11 @@ class GaussianRenderBase:
 
     def update_gaussian_data(self, gaus: util_gau.GaussianData):
         raise NotImplementedError()
-    
+    # def update_gaussian_data_from_pvg(self, pc, cam_time_shift, time_shift):
+    #     raise NotImplementedError()
+    # def update_env_map(self, env_map):
+    #     raise NotImplementedError()
+            
     def sort_and_update(self):
         raise NotImplementedError()
 

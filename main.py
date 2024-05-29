@@ -12,7 +12,8 @@ import os
 import sys
 import argparse
 from renderer_ogl import OpenGLRenderer, GaussianRenderBase
-
+from util_envlight import EnvLight
+import torch
 
 # Add the directory containing main.py to the Python path
 dir_path = os.path.dirname(os.path.realpath(__file__))
@@ -98,12 +99,12 @@ def update_camera_intrin_lazy():
         g_renderer.update_camera_intrin(g_camera)
         g_camera.is_intrin_dirty = False
 
-def update_activated_renderer_state(gaus: util_gau.GaussianData):
-    g_renderer.update_gaussian_data(gaus)
+def update_activated_renderer_state(gaus: util_gau.GaussianData, cam_time_stamp = 0, time_stamp = 0):
+    g_renderer.update_camera_pose(g_camera)
+    g_renderer.update_gaussian_data_from_pvg(gaus, cam_time_stamp, time_stamp)
     g_renderer.sort_and_update(g_camera)
     g_renderer.set_scale_modifier(g_scale_modifier)
     g_renderer.set_render_mod(g_render_mode - 3)
-    g_renderer.update_camera_pose(g_camera)
     g_renderer.update_camera_intrin(g_camera)
     g_renderer.set_render_reso(g_camera.w, g_camera.h)
 
@@ -112,14 +113,14 @@ def window_resize_callback(window, width, height):
     g_camera.update_resolution(height, width)
     g_renderer.set_render_reso(width, height)
 
-def main():
+def main(args):
     global g_camera, g_renderer, g_renderer_list, g_renderer_idx, g_scale_modifier, g_auto_sort, \
         g_show_control_win, g_show_help_win, g_show_camera_win, \
         g_render_mode, g_render_mode_tables
         
     imgui.create_context()
-    if args.hidpi:
-        imgui.get_io().font_global_scale = 1.5
+    # if args.hidpi is not None:
+    #     imgui.get_io().font_global_scale = 1.5
     window = impl_glfw_init()
     impl = GlfwRenderer(window)
     root = tk.Tk()  # used for file dialog
@@ -135,19 +136,38 @@ def main():
     # init renderer
     g_renderer_list[BACKEND_OGL] = OpenGLRenderer(g_camera.w, g_camera.h)
     try:
-        from renderer_cuda import CUDARenderer
+        from renderer_cuda_pvg import CUDARenderer
         g_renderer_list += [CUDARenderer(g_camera.w, g_camera.h)]
     except ImportError:
         g_renderer_idx = BACKEND_OGL
     else:
         g_renderer_idx = BACKEND_CUDA
 
-    g_renderer = g_renderer_list[g_renderer_idx]
+    g_renderer = g_renderer_list[BACKEND_CUDA]
 
     # gaussian data
-    gaussians = util_gau.naive_gaussian()
+    # gaussians = util_gau.naive_gaussian()
+    try:
+        from util_pvg import GaussianModel
+        gaussians = GaussianModel(args)
+        env_map = EnvLight(resolution=1024).cuda()
+        
+        gs_checkpoint = os.path.join(args.file_path, "chkpnt.pth")
+        env_checkpoint = os.path.join(args.file_path, "env_light_chkpnt.pth")
+        
+        (model_params, first_iter) = torch.load(gs_checkpoint)
+        gaussians.restore(model_params, args)
+        (light_params, _) = torch.load(env_checkpoint)
+        env_map.restore(light_params)
+        update_camera_pose_lazy()
+        g_renderer.update_env_map(env_map)
+        g_renderer.update_gaussian_data_from_pvg(gaussians)
+        g_renderer.sort_and_update(g_camera)
+    except RuntimeError as e:
+        pass
     update_activated_renderer_state(gaussians)
-    
+    cam_time_stamp = 0
+    time_stamp = 0
     # settings
     while not glfw.window_should_close(window):
         glfw.poll_events()
@@ -191,19 +211,28 @@ def main():
                         "reduce updates", g_renderer.reduce_updates,
                     )
 
-                imgui.text(f"# of Gaus = {len(gaussians)}")
-                if imgui.button(label='open ply'):
-                    file_path = filedialog.askopenfilename(title="open ply",
-                        initialdir="C:\\Users\\MSI_NB\\Downloads\\viewers",
-                        filetypes=[('ply file', '.ply')]
-                        )
-                    if file_path:
-                        try:
-                            gaussians = util_gau.load_ply(file_path)
-                            g_renderer.update_gaussian_data(gaussians)
-                            g_renderer.sort_and_update(g_camera)
-                        except RuntimeError as e:
-                            pass
+                # imgui.text(f"# of Gaus = {len(gaussians)}")
+                # if imgui.button(label='open ply'):
+                #     file_path = filedialog.askopenfilename(title="open ply",
+                #         initialdir="C:\\Users\\MSI_NB\\Downloads\\viewers",
+                #         filetypes=[('ply file', '.ply')]
+                #         )
+                #     if file_path:
+                #         try:
+                #             gaussians = util_gau.load_ply(file_path)
+                #             env_map = EnvLight(resolution=1024).cuda()
+                #             base_dir = os.path.dirname(file_path)
+                #             env_checkpoint = os.path.join(base_dir, "env_light_chkpnt.pth")
+                #             try:
+                #                 (light_params, _) = torch.load(env_checkpoint)
+                #                 env_map.restore(light_params)
+                #             except RuntimeError as e:
+                #                 pass
+                #             g_renderer.update_env_map(env_map)
+                #             g_renderer.update_gaussian_data(gaussians)
+                #             g_renderer.sort_and_update(g_camera)
+                #         except RuntimeError as e:
+                #             pass
                 
                 # camera fov
                 changed, g_camera.fovy = imgui.slider_float(
@@ -211,7 +240,14 @@ def main():
                 )
                 g_camera.is_intrin_dirty = changed
                 update_camera_intrin_lazy()
-                
+                changed0, cam_time_stamp = imgui.slider_float(
+                    "cam_timestamp", cam_time_stamp, -0.5, 0.5, "t = %.3f"
+                )
+                changed1, time_stamp = imgui.slider_float(
+                    "timestamp", time_stamp, -0.5, 0.5, "t = %.3f"
+                )
+                if changed1 or changed0:
+                    update_activated_renderer_state(gaus=gaussians, cam_time_stamp=cam_time_stamp, time_stamp=time_stamp)
                 # scale modifier
                 changed, g_scale_modifier = imgui.slider_float(
                     "", g_scale_modifier, 0.1, 10, "scale modifier = %.3f"
@@ -318,11 +354,20 @@ def main():
     impl.shutdown()
     glfw.terminate()
 
-
+from omegaconf import OmegaConf
 if __name__ == "__main__":
     global args
     parser = argparse.ArgumentParser(description="NeUVF editor with optional HiDPI support.")
-    parser.add_argument("--hidpi", action="store_true", help="Enable HiDPI scaling for the interface.")
+    # parser.add_argument("--hidpi", action="store_true", help="Enable HiDPI scaling for the interface.")
+    parser.add_argument("--config", type=str, default="./configs/waymo_reconstruction.yaml")
+    parser.add_argument("--base_config", type=str, default="./configs/base_config.yaml")
+    # parser.add_argument("--file_path", type=str, default="c:\\Users\\xinrui\\Desktop\\wangn\\dataset\\pvg_pth")
     args = parser.parse_args()
-
-    main()
+    print(args)
+    
+    base_conf = OmegaConf.load(args.base_config)
+    second_conf = OmegaConf.load(args.config)
+    # cli_conf = OmegaConf.from_cli()
+    args = OmegaConf.merge(base_conf, second_conf)
+    print(args)
+    main(args)
