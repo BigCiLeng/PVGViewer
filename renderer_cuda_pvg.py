@@ -110,8 +110,8 @@ class CUDARenderer(GaussianRenderBase):
         self.raster_settings = {
             "image_height": int(h),
             "image_width": int(w),
-            "tanfovx": -1,
-            "tanfovy": -1,
+            "tanfovx": np.tan(-0.5),
+            "tanfovy": np.tan(-0.5),
             "bg": torch.Tensor([0., 0., 0]).float().cuda(),
             "scale_modifier": 1.,
             "viewmatrix": None,
@@ -155,14 +155,8 @@ class CUDARenderer(GaussianRenderBase):
     def update_gaussian_data_from_pvg(self, pc: GaussianModel, cam_time_shift=0.1, time_shift=0.1):
         means3D = pc.get_xyz
         opacity = pc.get_opacity
-        print(cam_time_shift)
-        if time_shift is not None:
-            means3D = pc.get_xyz_SHM(cam_time_shift - time_shift)
-            means3D = means3D + pc.get_inst_velocity * time_shift
-            marginal_t = pc.get_marginal_t(cam_time_shift - time_shift)
-        else:
-            means3D = pc.get_xyz_SHM(cam_time_shift)
-            marginal_t = pc.get_marginal_t(cam_time_shift)
+        means3D = pc.get_xyz_SHM(cam_time_shift)
+        marginal_t = pc.get_marginal_t(cam_time_shift)
         opacity = opacity * marginal_t
         scales = pc.get_scaling
         rotations = pc.get_rotation
@@ -234,13 +228,14 @@ class CUDARenderer(GaussianRenderBase):
         self.raster_settings["image_width"] = int(w)
         gl.glViewport(0, 0, w, h)
         self.set_gl_texture(h, w)
-        self.grid = kornia.utils.create_meshgrid(int(h), int(w), normalized_coordinates=False, device='cuda')[0]
+        self.grid = kornia.utils.create_meshgrid(int(self.raster_settings["image_height"]), int(self.raster_settings["image_width"]), normalized_coordinates=False, device='cuda')[0]
 
     def update_camera_pose(self, camera: util.Camera):
         self.need_rerender = True
         view_matrix = camera.get_view_matrix()
         view_matrix[[0, 2], :] = -view_matrix[[0, 2], :]
         proj = camera.get_project_matrix() @ view_matrix
+        proj[[2, 3], :] = -proj[[2, 3], :]
         self.raster_settings["viewmatrix"] = torch.tensor(view_matrix.T).float().cuda()
         self.raster_settings["campos"] = torch.tensor(camera.position).float().cuda()
         self.raster_settings["projmatrix"] = torch.tensor(proj.T).float().cuda()
@@ -250,23 +245,24 @@ class CUDARenderer(GaussianRenderBase):
         view_matrix = camera.get_view_matrix()
         view_matrix[[0, 2], :] = -view_matrix[[0, 2], :]
         proj = camera.get_project_matrix() @ view_matrix
+        proj[[2, 3], :] = -proj[[2, 3], :]
         self.raster_settings["projmatrix"] = torch.tensor(proj.T).float().cuda()
-        hfovx, hfovy, focal = camera.get_htanfovxy_focal()
-        self.focal = focal
-        self.raster_settings["tanfovx"] = hfovx
-        self.raster_settings["tanfovy"] = hfovy
+        self.focal = camera.fy
+        self.cx = camera.cx
+        self.cy = camera.cy
     
     def get_world_direction(self):
         u, v = self.grid.unbind(-1)
         directions = torch.stack(
             [
-                (u - self.raster_settings["image_width"] / 2 + 0.5) / self.focal,
-                (v - self.raster_settings["image_width"] / 2 + 0.5) / self.focal,
+                (u - self.cx + 0.5) / self.focal,
+                (v - self.cy + 0.5) / self.focal,
                 torch.ones_like(u),
             ], dim=0
         )
         directions = F.normalize(directions, dim=0)
-        # directions = self.
+        c2w = self.raster_settings["viewmatrix"].transpose(0, 1).inverse()[:3, :3]
+        directions = (c2w @ directions.reshape(3, -1)).reshape(3, int(self.raster_settings["image_height"]), int(self.raster_settings["image_width"]))
         return directions
         
     def draw(self):
@@ -279,14 +275,8 @@ class CUDARenderer(GaussianRenderBase):
 
         self.need_rerender = False
 
-        # run cuda rasterizer now is just a placeholder
-        # img = torch.meshgrid((torch.linspace(0, 1, 720), torch.linspace(0, 1, 1280)))
-        # img = torch.stack([img[0], img[1], img[1], img[1]], dim=-1)
-        # img = img.float().cuda(0)
-        # img = img.contiguous()
         raster_settings = GaussianRasterizationSettings(**self.raster_settings)
         rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-        # means2D = torch.zeros_like(self.gaussians.xyz, dtype=self.gaussians.xyz.dtype, requires_grad=False, device="cuda")
 
         with torch.no_grad():
             if self.gaussians.mask is not None:
@@ -302,10 +292,10 @@ class CUDARenderer(GaussianRenderBase):
                     cov3D_precomp = None,
                     mask = self.gaussians.mask,
                 )
-                # rendered_other, rendered_depth, rendered_opacity = rendered_feature.split([0, 1, 1], dim=0)
-                # world_direction = self.get_world_direction()
-                # bg_color_from_env_map = self.env_map(world_direction.permute(1, 2, 0)).permute(2, 0, 1)
-                # img = img + (1 - rendered_opacity) * bg_color_from_env_map
+                rendered_other, rendered_depth, rendered_opacity = rendered_feature.split([0, 1, 1], dim=0)
+                world_direction = self.get_world_direction()
+                bg_color_from_env_map = self.env_map(world_direction.permute(1, 2, 0)).permute(2, 0, 1)
+                img = img + (1 - rendered_opacity) * bg_color_from_env_map
             else:
                 img, radii = rasterizer(
                     means3D = self.gaussians.xyz,

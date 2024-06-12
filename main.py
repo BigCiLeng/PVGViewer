@@ -14,6 +14,7 @@ import argparse
 from renderer_ogl import OpenGLRenderer, GaussianRenderBase
 from util_envlight import EnvLight
 import torch
+import json
 
 # Add the directory containing main.py to the Python path
 dir_path = os.path.dirname(os.path.realpath(__file__))
@@ -23,7 +24,7 @@ sys.path.append(dir_path)
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 
-g_camera = util.Camera(720, 1280)
+g_camera = util.Camera(1080, 1920)
 BACKEND_OGL=0
 BACKEND_CUDA=1
 g_renderer_list = [
@@ -112,6 +113,27 @@ def window_resize_callback(window, width, height):
     gl.glViewport(0, 0, width, height)
     g_camera.update_resolution(height, width)
     g_renderer.set_render_reso(width, height)
+    
+def update_cam(cam_config, cam_idx, g_camera):
+    rotation_matrix = np.array(cam_config[cam_idx]["rotation"])
+    # rotation_matrix[:,1] *= -1
+    g_camera.w = cam_config[cam_idx]["width"]
+    g_camera.h = cam_config[cam_idx]["height"]
+    roll, pitch, yaw = g_camera.RM2EA(rotation_matrix)
+    g_camera.yaw = yaw
+    g_camera.pitch = pitch
+    g_camera.position = np.array(cam_config[cam_idx]["position"])
+    g_camera.cx = cam_config[cam_idx]["cx"]
+    g_camera.cy = cam_config[cam_idx]["cy"]
+    g_camera.fx = cam_config[cam_idx]["fx"]
+    g_camera.fy = cam_config[cam_idx]["fy"]
+    g_camera.up = rotation_matrix[:,1]
+    g_camera.target = g_camera.position + rotation_matrix[:,2] * 0.0000000000000001
+    g_camera.fovy = g_camera.get_fov()
+    g_camera.cam_time_stamp = cam_config[cam_idx]["timestamp"]
+    g_camera.last_x = g_camera.w / 2
+    g_camera.last_y = g_camera.h / 2
+    return g_camera
 
 def main(args):
     global g_camera, g_renderer, g_renderer_list, g_renderer_idx, g_scale_modifier, g_auto_sort, \
@@ -135,14 +157,8 @@ def main(args):
 
     # init renderer
     g_renderer_list[BACKEND_OGL] = OpenGLRenderer(g_camera.w, g_camera.h)
-    try:
-        from renderer_cuda_pvg import CUDARenderer
-        g_renderer_list += [CUDARenderer(g_camera.w, g_camera.h)]
-    except ImportError:
-        g_renderer_idx = BACKEND_OGL
-    else:
-        g_renderer_idx = BACKEND_CUDA
-
+    from renderer_cuda_pvg import CUDARenderer
+    g_renderer_list += [CUDARenderer(g_camera.w, g_camera.h)]
     g_renderer = g_renderer_list[BACKEND_CUDA]
 
     # gaussian data
@@ -154,7 +170,8 @@ def main(args):
         
         gs_checkpoint = os.path.join(args.file_path, "chkpnt.pth")
         env_checkpoint = os.path.join(args.file_path, "env_light_chkpnt.pth")
-        
+        with open(os.path.join(args.file_path, "cameras.json")) as f:
+            cam_config = json.load(f)
         (model_params, first_iter) = torch.load(gs_checkpoint)
         gaussians.restore(model_params, args)
         (light_params, _) = torch.load(env_checkpoint)
@@ -165,9 +182,11 @@ def main(args):
         g_renderer.sort_and_update(g_camera)
     except RuntimeError as e:
         pass
-    update_activated_renderer_state(gaussians)
-    cam_time_stamp = 0
-    time_stamp = 0
+    
+    cam_idx = 0
+    g_camera = update_cam(cam_config, cam_idx, g_camera)
+    
+    update_activated_renderer_state(gaussians, cam_time_stamp=g_camera.cam_time_stamp)
     # settings
     while not glfw.window_should_close(window):
         glfw.poll_events()
@@ -200,10 +219,10 @@ def main(args):
         if g_show_control_win:
             if imgui.begin("Control", True):
                 # rendering backend
-                changed, g_renderer_idx = imgui.combo("backend", g_renderer_idx, ["ogl", "cuda"][:len(g_renderer_list)])
-                if changed:
-                    g_renderer = g_renderer_list[g_renderer_idx]
-                    update_activated_renderer_state(gaussians)
+                # changed, g_renderer_idx = imgui.combo("backend", g_renderer_idx, ["ogl", "cuda"][:len(g_renderer_list)])
+                # if changed:
+                #     g_renderer = g_renderer_list[g_renderer_idx]
+                #     update_activated_renderer_state(gaussians)
 
                 imgui.text(f"fps = {imgui.get_io().framerate:.1f}")
 
@@ -240,14 +259,22 @@ def main(args):
                 )
                 g_camera.is_intrin_dirty = changed
                 update_camera_intrin_lazy()
-                changed0, cam_time_stamp = imgui.slider_float(
-                    "cam_timestamp", cam_time_stamp, -0.5, 0.5, "t = %.3f"
+                changed, g_camera.cam_time_stamp = imgui.slider_float(
+                    "cam_timestamp", g_camera.cam_time_stamp, -0.5, 0.5, "t = %.3f"
                 )
-                changed1, time_stamp = imgui.slider_float(
-                    "timestamp", time_stamp, -0.5, 0.5, "t = %.3f"
-                )
-                if changed1 or changed0:
-                    update_activated_renderer_state(gaus=gaussians, cam_time_stamp=cam_time_stamp, time_stamp=time_stamp)
+                # changed1, time_stamp = imgui.slider_float(
+                #     "timestamp", time_stamp, -0.5, 0.5, "t = %.3f"
+                # )
+                if changed:
+                    update_activated_renderer_state(gaus=gaussians, cam_time_stamp=g_camera.cam_time_stamp)
+                
+                changed, cam_idx = imgui.slider_int(
+                    "cam_idx", cam_idx, 0, len(cam_config), format="%d"
+                )                
+                if changed:
+                    g_camera = update_cam(cam_config, cam_idx, g_camera)
+                    update_activated_renderer_state(gaussians, cam_time_stamp=g_camera.cam_time_stamp)
+
                 # scale modifier
                 changed, g_scale_modifier = imgui.slider_float(
                     "", g_scale_modifier, 0.1, 10, "scale modifier = %.3f"
@@ -259,12 +286,7 @@ def main(args):
                     
                 if changed:
                     g_renderer.set_scale_modifier(g_scale_modifier)
-                
-                # render mode
-                changed, g_render_mode = imgui.combo("shading", g_render_mode, g_render_mode_tables)
-                if changed:
-                    g_renderer.set_render_mod(g_render_mode - 4)
-                
+                                           
                 # sort button
                 if imgui.button(label='sort Gaussians'):
                     g_renderer.sort_and_update(g_camera)
@@ -361,13 +383,12 @@ if __name__ == "__main__":
     # parser.add_argument("--hidpi", action="store_true", help="Enable HiDPI scaling for the interface.")
     parser.add_argument("--config", type=str, default="./configs/waymo_reconstruction.yaml")
     parser.add_argument("--base_config", type=str, default="./configs/base_config.yaml")
-    # parser.add_argument("--file_path", type=str, default="c:\\Users\\xinrui\\Desktop\\wangn\\dataset\\pvg_pth")
-    args = parser.parse_args()
-    print(args)
+    args, _ = parser.parse_known_args()
+    # print(args)
     
     base_conf = OmegaConf.load(args.base_config)
     second_conf = OmegaConf.load(args.config)
-    # cli_conf = OmegaConf.from_cli()
-    args = OmegaConf.merge(base_conf, second_conf)
+    cli_conf = OmegaConf.from_cli()
+    args = OmegaConf.merge(base_conf, second_conf, cli_conf)
     print(args)
     main(args)

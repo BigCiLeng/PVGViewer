@@ -3,7 +3,9 @@ import OpenGL.GL.shaders as shaders
 import numpy as np
 import glm
 import ctypes
-
+import math
+def isClose(x, y, rtol=1.e-5, atol=1.e-8):
+    return abs(x-y) <= atol + rtol * abs(y)
 class Camera:
     def __init__(self, h, w):
         self.znear = 0.01
@@ -32,7 +34,25 @@ class Camera:
         self.zoom_sensitivity = 0.08
         self.roll_sensitivity = 0.03
         self.target_dist = 3.
-    
+        
+        self.cx = 960
+        self.cy = 540
+        self.fx = 883.535
+        self.fy = 883.38
+    def RM2EA(self, R):
+        phi = 0.0
+        if isClose(R[2,0],-1.0):
+            theta = math.pi/2.0
+            psi = math.atan2(R[0,1],R[0,2])
+        elif isClose(R[2,0],1.0):
+            theta = -math.pi/2.0
+            psi = math.atan2(-R[0,1],-R[0,2])
+        else:
+            theta = -math.asin(R[2,0])
+            cos_theta = math.cos(theta)
+            psi = math.atan2(R[2,1]/cos_theta, R[2,2]/cos_theta)
+            phi = math.atan2(R[1,0]/cos_theta, R[0,0]/cos_theta)
+        return psi, theta, phi
     def _global_rot_mat(self):
         x = np.array([1, 0, 0])
         z = np.cross(x, self.up)
@@ -68,6 +88,9 @@ class Camera:
 
     def get_focal(self):
         return self.h / (2 * np.tan(self.fovy / 2))
+    
+    def get_fov(self):
+        return 2 * np.arctan(self.h / (2*self.fy))
 
     def process_mouse(self, xpos, ypos):
         if self.first_mouse:
